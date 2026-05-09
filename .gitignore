@@ -1,0 +1,21 @@
+# Session and working state (lives in the image dir, not the repo)
+.lifestages_session.json
+last_dir.txt
+session.json
+
+# Generated output
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Playwright
+test-results/
+playwright-report/
+
+# OS
+.DS_Store
+Thumbs.db
