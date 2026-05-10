@@ -9,6 +9,7 @@ crop_data_state:  dict of str(list_index) -> cropped_file_path
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -39,11 +40,75 @@ LTX_CWD        = os.environ.get("LTX_CWD", str(Path(__file__).parent))
 
 APP_DIR        = Path(__file__).parent
 OUTPUT_DIR     = APP_DIR / "output"
-CROP_DIR       = OUTPUT_DIR / "crops"
+CROP_DIR       = OUTPUT_DIR / "crops"   # legacy fallback (pre-migration crops live here)
 LAST_DIR_FILE  = APP_DIR / "last_dir.txt"
 SESSION_NAME   = ".lifestages_session.json"
+CROPS_SUBDIR   = ".lifestages_crops"    # crops are now stored *inside* the images dir
 OUTPUT_DIR.mkdir(exist_ok=True)
 CROP_DIR.mkdir(exist_ok=True)
+
+
+def _crops_dir_for(directory: str) -> Path:
+    """Return (and create) the per-images-directory crops folder.
+
+    Falls back to the legacy app-level CROP_DIR only if `directory` is empty.
+    Storing crops inside the images dir means a zip of that dir is self-contained.
+    """
+    if not directory or not str(directory).strip():
+        return CROP_DIR
+    p = Path(directory) / CROPS_SUBDIR
+    p.mkdir(exist_ok=True)
+    return p
+
+
+# ── Path serialization (relative paths in session JSON so the dir is portable) ─
+
+def _to_rel(path_str: str, directory: str) -> str:
+    """Serialize an absolute path as relative to `directory` when possible."""
+    if not path_str or not directory:
+        return path_str
+    try:
+        rel = Path(path_str).resolve().relative_to(Path(directory).resolve())
+        return str(rel)
+    except Exception:
+        return path_str
+
+
+def _from_rel(path_str: str, directory: str) -> str:
+    """Deserialize a (possibly-relative) path stored in the session.
+
+    Strategy (try most-likely-correct first; never silently re-anchor a path
+    that already resolves to a real file):
+      1. Try the path as-is from the current CWD. Handles:
+         - absolute paths (new and old sessions)
+         - CWD-relative paths from older sessions (e.g. "Donna/foo.JPG")
+      2. If that fails AND the path is relative, try anchored at `directory`
+         (the new format stores paths like "foo.JPG" or
+         ".lifestages_crops/foo.jpg" relative to the images dir).
+      3. Basename fallback: try `directory/<basename>` and
+         `directory/.lifestages_crops/<basename>` for sessions transferred
+         from another machine where absolute paths no longer resolve.
+      4. Otherwise return the original string and let the caller's
+         `.exists()` check drop it.
+    """
+    if not path_str:
+        return path_str
+    p = Path(path_str)
+    # 1. As-is.
+    if p.exists():
+        return str(p)
+    # 2. Anchored at the images dir (only for relative paths).
+    if directory and not p.is_absolute():
+        anchored = Path(directory) / p
+        if anchored.exists():
+            return str(anchored)
+    # 3. Basename fallback (for sessions moved between machines).
+    if directory:
+        for candidate in (Path(directory) / p.name,
+                          Path(directory) / CROPS_SUBDIR / p.name):
+            if candidate.exists():
+                return str(candidate)
+    return str(p)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".tiff"}
 THUMB_SIZE = (150, 200)
@@ -133,16 +198,37 @@ def _session_file(directory: str) -> Path:
     return Path(directory) / SESSION_NAME
 
 
-def save_session(image_list: list, crop_data: dict, directory: str) -> str:
+def save_session(image_list: list, crop_data: dict, directory: str,
+                 removed_paths=None) -> str:
     if not directory.strip():
         return ""
+    # Serialize paths as relative to the images dir so a zip of the dir is portable.
+    serial_list = [
+        {"id": it["id"], "path": _to_rel(it["path"], directory)}
+        for it in image_list
+    ]
+    serial_crop = {k: _to_rel(v, directory) for k, v in crop_data.items()}
+    # If caller didn't pass removed_paths, preserve whatever's already on disk
+    # so non-remove callers (rotate, crop, drag, copy) don't accidentally clear it.
+    if removed_paths is None:
+        existing = load_session_for_dir(directory) or {}
+        removed_paths = existing.get("removed_paths", [])
     data = {
         "saved": datetime.now().isoformat(timespec="seconds"),
         "directory": directory,
-        "image_list": image_list,
-        "crop_data": crop_data,
+        "image_list": serial_list,
+        "crop_data": serial_crop,
+        "removed_paths": list(removed_paths),
     }
-    _session_file(directory).write_text(json.dumps(data, indent=2))
+    sf = _session_file(directory)
+    # Safety net: keep a .bak of the previous session before overwriting,
+    # so a buggy save can never silently destroy the user's work.
+    try:
+        if sf.exists():
+            shutil.copy2(sf, sf.with_suffix(sf.suffix + ".bak"))
+    except Exception:
+        pass
+    sf.write_text(json.dumps(data, indent=2))
     LAST_DIR_FILE.write_text(directory)
     return f"Session auto-saved  ({datetime.now().strftime('%H:%M:%S')})"
 
@@ -251,17 +337,56 @@ def load_images_from_dir(directory: str):
     # 1. Full session restore
     session = load_session_for_dir(directory)
     if session:
-        image_list = session.get("image_list", [])
-        crop_data  = session.get("crop_data", {})
+        raw_list  = session.get("image_list", [])
+        raw_crop  = session.get("crop_data", {})
+        # Resolve stored (possibly-relative) paths against the current directory.
+        image_list = [
+            {"id": it["id"], "path": _from_rel(it["path"], directory)}
+            for it in raw_list
+        ]
+        crop_data  = {k: _from_rel(v, directory) for k, v in raw_crop.items()}
         # Validate: drop entries whose source image no longer exists
         image_list = [it for it in image_list if Path(it["path"]).exists()]
         crop_data  = {k: v for k, v in crop_data.items()
                       if int(k) < len(image_list) and Path(v).exists()}
-        # Append any new images not already in the session
+        # Migrate any crop files that live outside the images dir into
+        # <images_dir>/.lifestages_crops/ so the session is self-contained.
+        target = _crops_dir_for(directory)
+        try:
+            target_resolved = target.resolve()
+        except Exception:
+            target_resolved = target
+        migrated = False
+        for k, src_path in list(crop_data.items()):
+            sp = Path(src_path)
+            try:
+                if not sp.exists():
+                    continue
+                sp_resolved = sp.resolve()
+                # already inside the target dir? skip
+                if target_resolved in sp_resolved.parents:
+                    continue
+                dest = target / sp.name
+                # avoid clobber: if a different file exists, give a unique name
+                if dest.exists() and dest.resolve() != sp_resolved:
+                    dest = target / f"{dest.stem}_{uuid4().hex[:6]}{dest.suffix}"
+                shutil.move(str(sp), str(dest))
+                crop_data[k] = str(dest)
+                migrated = True
+            except Exception:
+                pass
+        # Append any new images not already in the session, skipping ones the
+        # user explicitly removed (tracked in `removed_paths`).
+        removed_paths = set(session.get("removed_paths", []))
         known = {it["path"] for it in image_list}
         for p in all_paths:
-            if str(p) not in known:
-                image_list.append(make_item(str(p)))
+            if str(p) in known:
+                continue
+            if _to_rel(str(p), directory) in removed_paths:
+                continue
+            image_list.append(make_item(str(p)))
+        if migrated:
+            save_session(image_list, crop_data, directory)
         ts = session.get("saved", "")
         return image_list, crop_data, f"Restored session from {ts} ({len(image_list)} images)"
 
@@ -269,7 +394,7 @@ def load_images_from_dir(directory: str):
     order_file = d / "order.json"
     if order_file.exists():
         try:
-            saved_paths = json.loads(order_file.read_text())
+            saved_paths = [_from_rel(p, directory) for p in json.loads(order_file.read_text())]
             existing = [p for p in saved_paths if Path(p).exists()]
             saved_set = set(existing)
             for p in all_paths:
@@ -358,6 +483,7 @@ def remove_selected(image_list: list, crop_data: dict, selected_idx, directory: 
     if selected_idx is None or not image_list:
         return image_list, crop_data, None, render_sortable_html(image_list, crop_data), "Nothing selected", "", "None"
     idx = int(selected_idx)
+    removed_path = image_list[idx]["path"]
     new_list = [item for i, item in enumerate(image_list) if i != idx]
     new_crop = {}
     for k, v in crop_data.items():
@@ -368,7 +494,15 @@ def remove_selected(image_list: list, crop_data: dict, selected_idx, directory: 
     new_idx = min(idx, len(new_list) - 1) if new_list else None
     label   = (f"[{new_idx+1}] {Path(new_list[new_idx]['path']).name}"
                if new_idx is not None else "None")
-    status  = save_session(new_list, new_crop, directory)
+    # Persist this removal: if no other entry shares the path, add to removed_paths
+    # so a subsequent reload doesn't auto-re-add the file.
+    existing = load_session_for_dir(directory) or {}
+    removed = list(existing.get("removed_paths", []))
+    if not any(it["path"] == removed_path for it in new_list):
+        rel = _to_rel(removed_path, directory)
+        if rel not in removed:
+            removed.append(rel)
+    status  = save_session(new_list, new_crop, directory, removed_paths=removed)
     return new_list, new_crop, new_idx, render_sortable_html(new_list, new_crop), f"Removed image {idx+1}", status, label
 
 
@@ -378,7 +512,7 @@ def rotate_image(image_list: list, crop_data: dict, selected_idx, degrees: int, 
     idx = int(selected_idx)
     src = get_effective_path(image_list, crop_data, idx)
     img = Image.open(src).convert("RGB").rotate(-degrees, expand=True)
-    rot_path = str(CROP_DIR / f"{Path(image_list[idx]['path']).stem}_rot{degrees}_{uuid4().hex[:6]}.jpg")
+    rot_path = str(_crops_dir_for(directory) / f"{Path(image_list[idx]['path']).stem}_rot{degrees}_{uuid4().hex[:6]}.jpg")
     img.save(rot_path, "JPEG", quality=95)
     new_crop = dict(crop_data)
     new_crop[str(idx)] = rot_path
@@ -396,7 +530,7 @@ def save_crop_fn(image_list: list, crop_data: dict, selected_idx, cropped_image,
         return crop_data, "No image data", render_sortable_html(image_list, crop_data), ""
     if not isinstance(img, Image.Image):
         img = Image.fromarray(img)
-    crop_path = str(CROP_DIR / f"{Path(image_list[idx]['path']).stem}_crop_{uuid4().hex[:6]}.jpg")
+    crop_path = str(_crops_dir_for(directory) / f"{Path(image_list[idx]['path']).stem}_crop_{uuid4().hex[:6]}.jpg")
     img.convert("RGB").save(crop_path, "JPEG", quality=95)
     new_crop = dict(crop_data)
     new_crop[str(idx)] = crop_path
@@ -408,7 +542,8 @@ def save_order_fn(image_list: list, directory: str):
     if not image_list or not directory.strip():
         return "No images loaded"
     d = Path(directory.strip())
-    (d / "order.json").write_text(json.dumps([item["path"] for item in image_list], indent=2))
+    rel_paths = [_to_rel(item["path"], directory) for item in image_list]
+    (d / "order.json").write_text(json.dumps(rel_paths, indent=2))
     return f"Saved order.json ({len(image_list)} images)"
 
 
