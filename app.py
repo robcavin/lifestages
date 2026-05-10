@@ -123,6 +123,7 @@ async () => {
 SORTABLE_CSS = """<style>
 .ls-ghost { opacity:0.4; background:#4f46e5 !important; }
 .ls-card:hover { border-color:#6b7280 !important; }
+.ls-hidden { display: none !important; }
 </style>"""
 
 
@@ -285,13 +286,30 @@ def load_images_from_dir(directory: str):
 
 # ── State operations ──────────────────────────────────────────────────────────
 
-def apply_drag_order(new_order_json: str, image_list: list, crop_data: dict, directory: str):
+def _label_for(image_list: list, idx) -> str:
+    if idx is None or not image_list:
+        return "None"
+    try:
+        i = int(idx)
+    except Exception:
+        return "None"
+    if i < 0 or i >= len(image_list):
+        return "None"
+    return f"[{i+1}] {Path(image_list[i]['path']).name}"
+
+
+def apply_drag_order(new_order_json: str, image_list: list, crop_data: dict,
+                     selected_idx, directory: str):
     if not new_order_json or not new_order_json.strip():
-        return image_list, crop_data, render_sortable_html(image_list, crop_data), ""
+        return (image_list, crop_data, selected_idx,
+                render_sortable_html(image_list, crop_data),
+                _label_for(image_list, selected_idx), "")
     try:
         new_ids = json.loads(new_order_json)
     except Exception:
-        return image_list, crop_data, render_sortable_html(image_list, crop_data), ""
+        return (image_list, crop_data, selected_idx,
+                render_sortable_html(image_list, crop_data),
+                _label_for(image_list, selected_idx), "")
 
     id_to_item  = {item["id"]: item for item in image_list}
     old_index   = {item["id"]: i    for i, item in enumerate(image_list)}
@@ -303,8 +321,24 @@ def apply_drag_order(new_order_json: str, image_list: list, crop_data: dict, dir
         if old_i is not None and str(old_i) in crop_data:
             new_crop[str(new_i)] = crop_data[str(old_i)]
 
+    # Track the previously-selected item by id so it follows the reorder
+    new_selected = None
+    if selected_idx is not None:
+        try:
+            old_i = int(selected_idx)
+            if 0 <= old_i < len(image_list):
+                old_id = image_list[old_i]["id"]
+                for new_i, id_ in enumerate(new_ids):
+                    if id_ == old_id:
+                        new_selected = new_i
+                        break
+        except Exception:
+            pass
+
     status = save_session(new_list, new_crop, directory)
-    return new_list, new_crop, render_sortable_html(new_list, new_crop), status
+    return (new_list, new_crop, new_selected,
+            render_sortable_html(new_list, new_crop),
+            _label_for(new_list, new_selected), status)
 
 
 def copy_selected(image_list: list, crop_data: dict, selected_idx, directory: str):
@@ -511,7 +545,10 @@ def build_ui():
             sortable_html = gr.HTML(
                 value=SORTABLE_CSS + "<p style='color:#888;padding:20px'>Load a directory above.</p>"
             )
-            order_box  = gr.Textbox(elem_id="ls-order-box", visible=False, label="drag-order")
+            order_box  = gr.Textbox(
+                elem_id="ls-order-box", elem_classes=["ls-hidden"],
+                label="drag-order",
+            )
             # Number must be visible — Gradio 6 doesn't render hidden components in the DOM
             select_box = gr.Number(
                 elem_id="ls-select-box", label="Selected # (click card or type)",
@@ -536,7 +573,7 @@ def build_ui():
                     crop_editor = gr.ImageEditor(
                         label="Crop image", type="pil",
                         transforms=("crop",), layers=False, eraser=False, brush=False,
-                        height=600,
+                        height=600, elem_id="ls-crop-editor",
                     )
                 with gr.Column(scale=1):
                     reload_crop_btn = gr.Button("↺ Reload original source")
@@ -613,11 +650,12 @@ def build_ui():
                      dir_state, sortable_html, selected_label, session_status]
         )
 
-        # Drag reorder
+        # Drag reorder (also remaps selected_idx to follow the moved item)
         order_box.change(
             apply_drag_order,
-            inputs=[order_box, image_list_state, crop_data_state, dir_state],
-            outputs=[image_list_state, crop_data_state, sortable_html, session_status],
+            inputs=[order_box, image_list_state, crop_data_state, selected_idx_state, dir_state],
+            outputs=[image_list_state, crop_data_state, selected_idx_state,
+                     sortable_html, selected_label, session_status],
         )
 
         # Click select (or manual number entry)
@@ -635,17 +673,38 @@ def build_ui():
         select_box.input(on_click_select, inputs=[select_box, image_list_state],
                          outputs=[selected_idx_state, selected_label])
 
-        # Rotate
+        # JS that activates the Crop tool inside the ImageEditor whenever a new image loads.
+        ACTIVATE_CROP_JS = """
+        async () => {
+            const editor = document.getElementById('ls-crop-editor');
+            if (!editor) return;
+            for (let i = 0; i < 30; i++) {
+                const btn = editor.querySelector('button[aria-label="Crop"]');
+                if (btn) { btn.click(); return; }
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }
+        """
+
+        # Rotate (also reloads the crop editor so rotation is reflected on the Crop tab)
         rot_cw_btn.click(
             lambda il, cd, idx, d: rotate_image(il, cd, idx, 90, d),
             inputs=[image_list_state, crop_data_state, selected_idx_state, dir_state],
             outputs=[crop_data_state, sortable_html, action_status, session_status],
-        )
+        ).then(
+            load_selected_for_crop,
+            inputs=[image_list_state, crop_data_state, selected_idx_state],
+            outputs=[crop_editor],
+        ).then(fn=None, js=ACTIVATE_CROP_JS)
         rot_ccw_btn.click(
             lambda il, cd, idx, d: rotate_image(il, cd, idx, -90, d),
             inputs=[image_list_state, crop_data_state, selected_idx_state, dir_state],
             outputs=[crop_data_state, sortable_html, action_status, session_status],
-        )
+        ).then(
+            load_selected_for_crop,
+            inputs=[image_list_state, crop_data_state, selected_idx_state],
+            outputs=[crop_editor],
+        ).then(fn=None, js=ACTIVATE_CROP_JS)
 
         # Copy
         copy_btn.click(copy_selected,
@@ -663,10 +722,13 @@ def build_ui():
             inputs=[image_list_state, dir_state], outputs=[action_status])
 
         # Crop tab — auto-loads effective image (with rotation/crop applied)
+        # Auto-activates the Crop tool after each load.
         reload_crop_btn.click(load_original_for_crop,
-            inputs=[image_list_state, selected_idx_state], outputs=[crop_editor])
+            inputs=[image_list_state, selected_idx_state], outputs=[crop_editor]
+        ).then(fn=None, js=ACTIVATE_CROP_JS)
         selected_idx_state.change(load_selected_for_crop,
-            inputs=[image_list_state, crop_data_state, selected_idx_state], outputs=[crop_editor])
+            inputs=[image_list_state, crop_data_state, selected_idx_state], outputs=[crop_editor]
+        ).then(fn=None, js=ACTIVATE_CROP_JS)
         save_crop_btn.click(save_crop_fn,
             inputs=[image_list_state, crop_data_state, selected_idx_state, crop_editor, dir_state],
             outputs=[crop_data_state, crop_status, sortable_html, session_status])
